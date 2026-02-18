@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use a2s::A2SClient;
 use dayz_monitor::{retrieve_server_info, DayzMonitorConfig, ServerInfo};
 use serenity::{
-    all::{ChannelId, CreateEmbed, CreateMessage, EditMessage, GatewayIntents, MessageId},
+    all::{ChannelId, CreateEmbed, CreateEmbedFooter, CreateMessage, EditMessage, GatewayIntents, MessageId},
     async_trait,
     model::gateway::Ready,
     prelude::*,
@@ -42,7 +42,6 @@ impl BotState {
         let filled = filled.min(width);
         let empty = width.saturating_sub(filled);
 
-        // looks good in Discord monospace
         format!("`{}{}`", "█".repeat(filled), "░".repeat(empty))
     }
 
@@ -72,7 +71,7 @@ impl EventHandler for Handler {
         let state = self.state.clone();
         let http = ctx.http.clone();
 
-        // If you set STATUS_MESSAGE_ID, we always edit that one.
+        // If STATUS_MESSAGE_ID is set, always edit that message.
         if let Some(mid) = state.config.status_message_id {
             *state.message_id.write().await = Some(MessageId::new(mid));
         }
@@ -87,8 +86,8 @@ impl EventHandler for Handler {
                     let embed = CreateEmbed::new()
                         .title("Starting…")
                         .description("Fetching server status…")
-                        .colour(0x5865F2) // Discord blurple-ish
-                        .footer(|f| f.text("dayz-monitor"));
+                        .colour(0x5865F2)
+                        .footer(CreateEmbedFooter::new("dayz-monitor"));
 
                     let msg = CreateMessage::new().add_embed(embed);
 
@@ -100,8 +99,7 @@ impl EventHandler for Handler {
                         Err(err) => {
                             tracing::error!("Failed to send initial status message: {err:#?}");
                             drop(lock);
-                            tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs))
-                                .await;
+                            tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs)).await;
                             continue;
                         }
                     }
@@ -128,7 +126,6 @@ impl EventHandler for Handler {
 }
 
 fn discord_ts(secs: u64, style: &str) -> String {
-    // style examples: "R" (relative), "f" (full), "t" (time)
     format!("<t:{secs}:{style}>")
 }
 
@@ -146,63 +143,14 @@ fn build_online_edit(state: &BotState, info: &ServerInfo) -> EditMessage {
         .description(format!(
             "👥 Players: {players}\n📊 Load: {bar} **{pct}%**\n{time}"
         ))
-        .colour(0x57F287) // green
+        .colour(0x57F287)
         .field("📍 Address", format!("`{}`", state.config.server_address), true)
         .field("🔄 Update interval", format!("`{}s`", state.config.update_interval_secs), true)
         .field("🕐 Last updated", format!("{last_rel}\n{last_full}"), false)
-        .footer(|f| f.text("dayz-monitor"));
+        .footer(CreateEmbedFooter::new("dayz-monitor"));
 
     EditMessage::new().embed(embed)
 }
 
 fn build_offline_edit(state: &BotState, err: &str) -> EditMessage {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let last_rel = discord_ts(now_secs, "R");
-    let last_full = discord_ts(now_secs, "f");
-
-    let embed = CreateEmbed::new()
-        .title(state.title_offline())
-        .description("⚠️ Could not query the server right now.")
-        .colour(0xED4245) // red
-        .field("📍 Address", format!("`{}`", state.config.server_address), true)
-        .field("🔄 Update interval", format!("`{}s`", state.config.update_interval_secs), true)
-        .field("🕐 Last updated", format!("{last_rel}\n{last_full}"), false)
-        .field("🧾 Error", format!("`{}`", err), false)
-        .footer(|f| f.text("dayz-monitor"));
-
-    EditMessage::new().embed(embed)
-}
-
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
-    let _ = dotenv::dotenv();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
-    tracing::info!("Loading dayz-monitor configuration from environment variables");
-    let config: DayzMonitorConfig = serde_env::from_env()?;
-
-    let a2s = Arc::new(A2SClient::new().await?);
-
-    // Status-only: no privileged intents needed.
-    let intents = GatewayIntents::GUILDS;
-
-    let state = Arc::new(BotState {
-        config: config.clone(),
-        a2s,
-        message_id: Arc::new(RwLock::new(None)),
-    });
-
-    let mut client = Client::builder(config.discord_token, intents)
-        .event_handler(Handler { state })
-        .await?;
-
-    client.start().await?;
-    Ok(())
-}
+    let now_secs = std::time::SystemTi_
