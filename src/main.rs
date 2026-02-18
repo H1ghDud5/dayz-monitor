@@ -3,7 +3,10 @@ use std::{sync::Arc, time::Duration};
 use a2s::A2SClient;
 use dayz_monitor::{retrieve_server_info, DayzMonitorConfig, ServerInfo};
 use serenity::{
-    all::{ChannelId, CreateEmbed, CreateEmbedFooter, CreateMessage, EditMessage, GatewayIntents, MessageId},
+    all::{
+        ChannelId, Client, CreateEmbed, CreateEmbedFooter, CreateMessage, EditMessage,
+        GatewayIntents, MessageId,
+    },
     async_trait,
     model::gateway::Ready,
     prelude::*,
@@ -17,61 +20,16 @@ struct BotState {
     message_id: Arc<RwLock<Option<MessageId>>>,
 }
 
-impl BotState {
-    fn title_online(&self) -> String {
-        format!("🟢 {} — Online", self.config.server_name)
-    }
-
-    fn title_offline(&self) -> String {
-        format!("🔴 {} — Offline", self.config.server_name)
-    }
-
-    fn occupancy_percent(&self, info: &ServerInfo) -> u32 {
-        if info.max_players == 0 {
-            return 0;
-        }
-        (((info.players as f64 / info.max_players as f64) * 100.0).round() as u32).min(100)
-    }
-
-    fn occupancy_bar(&self, info: &ServerInfo, width: usize) -> String {
-        if info.max_players == 0 {
-            return "`—`".to_string();
-        }
-        let ratio = (info.players as f64 / info.max_players as f64).clamp(0.0, 1.0);
-        let filled = (ratio * width as f64).round() as usize;
-        let filled = filled.min(width);
-        let empty = width.saturating_sub(filled);
-
-        format!("`{}{}`", "█".repeat(filled), "░".repeat(empty))
-    }
-
-    fn players_summary(&self, info: &ServerInfo) -> String {
-        let base = format!("**{} / {}**", info.players, info.max_players);
-        match info.players_in_queue {
-            Some(q) if q > 0 => format!("{base}  •  ⏳ Queue: **{q}**"),
-            _ => base,
-        }
-    }
-
-    fn time_summary(&self, info: &ServerInfo) -> String {
-        match &info.server_time {
-            Some(t) => format!("🕒 **{t}**"),
-            None => "🕒 *(unavailable)*".to_string(),
-        }
-    }
-}
-
 struct Handler {
     state: Arc<BotState>,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, ctx: Context, _ready: Ready) {
+    async fn ready(&self, ctx: Context, _: Ready) {
         let state = self.state.clone();
         let http = ctx.http.clone();
 
-        // If STATUS_MESSAGE_ID is set, always edit that message.
         if let Some(mid) = state.config.status_message_id {
             *state.message_id.write().await = Some(MessageId::new(mid));
         }
@@ -80,95 +38,124 @@ impl EventHandler for Handler {
             let channel_id = ChannelId::new(state.config.text_channel_id);
 
             loop {
-                // Ensure there is a message to edit (send once if missing)
-                let mut lock = state.message_id.write().await;
-                if lock.is_none() {
-                    let embed = CreateEmbed::new()
-                        .title("Starting…")
-                        .description("Fetching server status…")
-                        .colour(0x5865F2)
-                        .footer(CreateEmbedFooter::new("dayz-monitor"));
+                {
+                    let mut lock = state.message_id.write().await;
 
-                    let msg = CreateMessage::new().add_embed(embed);
+                    if lock.is_none() {
+                        let embed = CreateEmbed::new()
+                            .title("Starting…")
+                            .description("Fetching server status…")
+                            .colour(0x5865F2)
+                            .footer(CreateEmbedFooter::new("dayz-monitor"));
 
-                    match channel_id.send_message(&http, msg).await {
-                        Ok(sent) => {
-                            tracing::info!("Posted status message: {}", sent.id);
-                            *lock = Some(sent.id);
-                        }
-                        Err(err) => {
-                            tracing::error!("Failed to send initial status message: {err:#?}");
-                            drop(lock);
-                            tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs)).await;
-                            continue;
+                        let msg = CreateMessage::new().add_embed(embed);
+
+                        match channel_id.send_message(&http, msg).await {
+                            Ok(sent) => {
+                                *lock = Some(sent.id);
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_secs(
+                                    state.config.update_interval_secs,
+                                ))
+                                .await;
+                                continue;
+                            }
                         }
                     }
                 }
 
-                let msg_id = lock.unwrap();
-                drop(lock);
+                let msg_id = state.message_id.read().await.unwrap();
 
-                let result = retrieve_server_info(&state.a2s, state.config.server_address).await;
+                let result =
+                    retrieve_server_info(&state.a2s, state.config.server_address).await;
 
                 let edit = match result {
-                    Ok(info) => build_online_edit(&state, &info),
-                    Err(err) => build_offline_edit(&state, &err.to_string()),
+                    Ok(info) => build_online(&state, &info),
+                    Err(err) => build_offline(&state, &err.to_string()),
                 };
 
-                if let Err(err) = channel_id.edit_message(&http, msg_id, edit).await {
-                    tracing::error!("Failed to edit status message: {err:#?}");
-                }
+                let _ = channel_id.edit_message(&http, msg_id, edit).await;
 
-                tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs)).await;
+                tokio::time::sleep(Duration::from_secs(
+                    state.config.update_interval_secs,
+                ))
+                .await;
             }
         });
     }
 }
 
-fn discord_ts(secs: u64, style: &str) -> String {
-    format!("<t:{secs}:{style}>")
+fn occupancy_bar(players: u32, max: u32) -> String {
+    if max == 0 {
+        return "`—`".into();
+    }
+
+    let width = 18;
+    let ratio = players as f64 / max as f64;
+    let filled = (ratio * width as f64).round() as usize;
+    let empty = width - filled;
+
+    format!("`{}{}`", "█".repeat(filled), "░".repeat(empty))
 }
 
-fn build_online_edit(state: &BotState, info: &ServerInfo) -> EditMessage {
-    let pct = state.occupancy_percent(info);
-    let bar = state.occupancy_bar(info, 18);
-    let players = state.players_summary(info);
-    let time = state.time_summary(info);
+fn percent(players: u32, max: u32) -> u32 {
+    if max == 0 {
+        0
+    } else {
+        ((players as f64 / max as f64) * 100.0).round() as u32
+    }
+}
 
-    let last_rel = discord_ts(info.last_updated_unix, "R");
-    let last_full = discord_ts(info.last_updated_unix, "f");
+fn ts(secs: u64) -> String {
+    format!("<t:{}:R>", secs)
+}
+
+fn build_online(state: &BotState, info: &ServerInfo) -> EditMessage {
+    let pct = percent(info.players, info.max_players);
 
     let embed = CreateEmbed::new()
-        .title(state.title_online())
+        .title(format!("🟢 {} — Online", state.config.server_name))
         .description(format!(
-            "👥 Players: {players}\n📊 Load: {bar} **{pct}%**\n{time}"
+            "👥 **{} / {}**\n📊 {} **{}%**\n🕒 {}",
+            info.players,
+            info.max_players,
+            occupancy_bar(info.players, info.max_players),
+            pct,
+            info.server_time.clone().unwrap_or("Unknown".into())
         ))
         .colour(0x57F287)
-        .field("📍 Address", format!("`{}`", state.config.server_address), true)
-        .field("🔄 Update interval", format!("`{}s`", state.config.update_interval_secs), true)
-        .field("🕐 Last updated", format!("{last_rel}\n{last_full}"), false)
+        .field(
+            "📍 Address",
+            format!("`{}`", state.config.server_address),
+            true,
+        )
+        .field(
+            "🔄 Update Interval",
+            format!("`{}s`", state.config.update_interval_secs),
+            true,
+        )
+        .field(
+            "🕐 Last Updated",
+            ts(info.last_updated_unix),
+            false,
+        )
         .footer(CreateEmbedFooter::new("dayz-monitor"));
 
     EditMessage::new().embed(embed)
 }
 
-fn build_offline_edit(state: &BotState, err: &str) -> EditMessage {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let last_rel = discord_ts(now_secs, "R");
-    let last_full = discord_ts(now_secs, "f");
-
+fn build_offline(state: &BotState, err: &str) -> EditMessage {
     let embed = CreateEmbed::new()
-        .title(state.title_offline())
-        .description("⚠️ Could not query the server right now.")
+        .title(format!("🔴 {} — Offline", state.config.server_name))
+        .description("⚠️ Could not query the server.")
         .colour(0xED4245)
-        .field("📍 Address", format!("`{}`", state.config.server_address), true)
-        .field("🔄 Update interval", format!("`{}s`", state.config.update_interval_secs), true)
-        .field("🕐 Last updated", format!("{last_rel}\n{last_full}"), false)
-        .field("🧾 Error", format!("`{}`", err), false)
+        .field(
+            "📍 Address",
+            format!("`{}`", state.config.server_address),
+            true,
+        )
+        .field("Error", format!("`{}`", err), false)
         .footer(CreateEmbedFooter::new("dayz-monitor"));
 
     EditMessage::new().embed(embed)
@@ -182,12 +169,9 @@ async fn main() -> eyre::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    tracing::info!("Loading dayz-monitor configuration from environment variables");
     let config: DayzMonitorConfig = serde_env::from_env()?;
-
     let a2s = Arc::new(A2SClient::new().await?);
 
-    // Status-only bot: no privileged intents needed
     let intents = GatewayIntents::GUILDS;
 
     let state = Arc::new(BotState {
