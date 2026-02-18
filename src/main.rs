@@ -3,7 +3,9 @@ use std::{sync::Arc, time::Duration};
 use a2s::A2SClient;
 use dayz_monitor::{retrieve_server_info, DayzMonitorConfig, ServerInfo};
 use serenity::{
-    all::{ChannelId, EditMessage, GatewayIntents, MessageId},
+    all::{
+        ChannelId, CreateEmbed, CreateMessage, EditMessage, GatewayIntents, MessageId,
+    },
     async_trait,
     model::gateway::Ready,
     prelude::*,
@@ -28,7 +30,10 @@ impl BotState {
 
     fn line_players(&self, info: &ServerInfo) -> String {
         match info.players_in_queue {
-            Some(q) if q > 0 => format!("Players: **{} / {}**  •  Queue: **{}**", info.players, info.max_players, q),
+            Some(q) if q > 0 => format!(
+                "Players: **{} / {}**  •  Queue: **{}**",
+                info.players, info.max_players, q
+            ),
             _ => format!("Players: **{} / {}**", info.players, info.max_players),
         }
     }
@@ -63,24 +68,22 @@ impl EventHandler for Handler {
                 // Ensure there is a message to edit (send once if missing)
                 let mut lock = state.message_id.write().await;
                 if lock.is_none() {
-                    match channel_id
-                        .send_message(&http, |m| {
-                            m.embed(|e| {
-                                e.title("Starting…");
-                                e.description("Fetching server status…");
-                                e
-                            })
-                        })
-                        .await
-                    {
-                        Ok(msg) => {
-                            tracing::info!("Posted status message: {}", msg.id);
-                            *lock = Some(msg.id);
+                    let mut embed = CreateEmbed::new()
+                        .title("Starting…")
+                        .description("Fetching server status…");
+
+                    let msg = CreateMessage::new().add_embed(embed);
+
+                    match channel_id.send_message(&http, msg).await {
+                        Ok(sent) => {
+                            tracing::info!("Posted status message: {}", sent.id);
+                            *lock = Some(sent.id);
                         }
                         Err(err) => {
                             tracing::error!("Failed to send initial status message: {err:#?}");
                             drop(lock);
-                            tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs)).await;
+                            tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs))
+                                .await;
                             continue;
                         }
                     }
@@ -92,8 +95,8 @@ impl EventHandler for Handler {
                 let result = retrieve_server_info(&state.a2s, state.config.server_address).await;
 
                 let edit = match result {
-                    Ok(info) => build_online_embed(&state, &info),
-                    Err(err) => build_offline_embed(&state, &err.to_string()),
+                    Ok(info) => build_online_edit(&state, &info),
+                    Err(err) => build_offline_edit(&state, &err.to_string()),
                 };
 
                 if let Err(err) = channel_id.edit_message(&http, msg_id, edit).await {
@@ -106,38 +109,40 @@ impl EventHandler for Handler {
     }
 }
 
-fn build_online_embed(state: &BotState, info: &ServerInfo) -> EditMessage {
+fn now_relative_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("<t:{secs}:R>")
+}
+
+fn build_online_edit(state: &BotState, info: &ServerInfo) -> EditMessage {
     let title = state.title_online();
     let players_line = state.line_players(info);
     let time_line = state.line_time(info);
-    let updated = format!("<t:{}:R>", (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()));
+    let updated = now_relative_timestamp();
 
-    EditMessage::new().embed(|e| {
-        e.title(title);
-        e.description(players_line);
-        e.field("Details", time_line, false);
-        e.field("Last updated", updated, false);
-        e
-    })
+    let embed = CreateEmbed::new()
+        .title(title)
+        .description(players_line)
+        .field("Details", time_line, false)
+        .field("Last updated", updated, false);
+
+    EditMessage::new().embed(embed)
 }
 
-fn build_offline_embed(state: &BotState, err: &str) -> EditMessage {
+fn build_offline_edit(state: &BotState, err: &str) -> EditMessage {
     let title = state.title_offline();
-    let updated = format!("<t:{}:R>", (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()));
+    let updated = now_relative_timestamp();
 
-    EditMessage::new().embed(|e| {
-        e.title(title);
-        e.description("Could not query the server right now.");
-        e.field("Last updated", updated, false);
-        e.field("Error", err, false);
-        e
-    })
+    let embed = CreateEmbed::new()
+        .title(title)
+        .description("Could not query the server right now.")
+        .field("Last updated", updated, false)
+        .field("Error", err, false);
+
+    EditMessage::new().embed(embed)
 }
 
 #[tokio::main]
