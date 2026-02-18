@@ -1,6 +1,6 @@
 use a2s::{info::ExtendedServerInfo, A2SClient};
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -18,7 +18,6 @@ pub enum DayzMonitorError {
 fn default_server_name() -> String {
     "DayZ Server".to_string()
 }
-
 fn default_update_interval_secs() -> u64 {
     60
 }
@@ -48,6 +47,9 @@ pub struct ServerInfo {
     pub players_in_queue: Option<u32>,
     pub players: u32,
     pub max_players: u32,
+
+    /// Unix timestamp of the most recent successful query
+    pub last_updated_unix: u64,
 }
 
 pub async fn retrieve_server_info(
@@ -55,6 +57,7 @@ pub async fn retrieve_server_info(
     addr: SocketAddr,
 ) -> Result<ServerInfo, DayzMonitorError> {
     tracing::debug!("Querying server info for '{addr}'");
+
     let info = client.info(addr).await?;
 
     let mut server_info = extract_time_and_queue(info.extended_server_info)
@@ -62,6 +65,12 @@ pub async fn retrieve_server_info(
 
     server_info.players = info.players as u32;
     server_info.max_players = info.max_players as u32;
+
+    server_info.last_updated_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     Ok(server_info)
 }
 
@@ -74,14 +83,20 @@ fn extract_time_and_queue(info: ExtendedServerInfo) -> Option<ServerInfo> {
         players_in_queue: None,
         players: 0,
         max_players: 0,
+        last_updated_unix: 0,
     };
 
     for value in split {
+        // Queue is usually in keywords as lqs<number>
         if value.starts_with("lqs") {
-            server_info.players_in_queue = value.replace("lqs", "").parse::<u32>().ok();
+            server_info.players_in_queue = value
+                .replace("lqs", "")
+                .parse::<u32>()
+                .ok();
             continue;
         }
 
+        // Time looks like HH:MM:SS or HH:MM (keep it conservative)
         if value.contains(':') && server_info.server_time.is_none() && value.len() <= 8 {
             server_info.server_time = Some(value.to_owned());
         }
