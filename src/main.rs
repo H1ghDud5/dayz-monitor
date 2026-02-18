@@ -3,9 +3,7 @@ use std::{sync::Arc, time::Duration};
 use a2s::A2SClient;
 use dayz_monitor::{retrieve_server_info, DayzMonitorConfig, ServerInfo};
 use serenity::{
-    all::{
-        ChannelId, CreateEmbed, CreateMessage, EditMessage, GatewayIntents, MessageId,
-    },
+    all::{ChannelId, CreateEmbed, CreateMessage, EditMessage, GatewayIntents, MessageId},
     async_trait,
     model::gateway::Ready,
     prelude::*,
@@ -28,20 +26,38 @@ impl BotState {
         format!("🔴 {} — Offline", self.config.server_name)
     }
 
-    fn line_players(&self, info: &ServerInfo) -> String {
+    fn occupancy_percent(&self, info: &ServerInfo) -> u32 {
+        if info.max_players == 0 {
+            return 0;
+        }
+        (((info.players as f64 / info.max_players as f64) * 100.0).round() as u32).min(100)
+    }
+
+    fn occupancy_bar(&self, info: &ServerInfo, width: usize) -> String {
+        if info.max_players == 0 {
+            return "`—`".to_string();
+        }
+        let ratio = (info.players as f64 / info.max_players as f64).clamp(0.0, 1.0);
+        let filled = (ratio * width as f64).round() as usize;
+        let filled = filled.min(width);
+        let empty = width.saturating_sub(filled);
+
+        // looks good in Discord monospace
+        format!("`{}{}`", "█".repeat(filled), "░".repeat(empty))
+    }
+
+    fn players_summary(&self, info: &ServerInfo) -> String {
+        let base = format!("**{} / {}**", info.players, info.max_players);
         match info.players_in_queue {
-            Some(q) if q > 0 => format!(
-                "Players: **{} / {}**  •  Queue: **{}**",
-                info.players, info.max_players, q
-            ),
-            _ => format!("Players: **{} / {}**", info.players, info.max_players),
+            Some(q) if q > 0 => format!("{base}  •  ⏳ Queue: **{q}**"),
+            _ => base,
         }
     }
 
-    fn line_time(&self, info: &ServerInfo) -> String {
+    fn time_summary(&self, info: &ServerInfo) -> String {
         match &info.server_time {
-            Some(t) => format!("Server time: **{}**", t),
-            None => "Server time: *(unavailable)*".to_string(),
+            Some(t) => format!("🕒 **{t}**"),
+            None => "🕒 *(unavailable)*".to_string(),
         }
     }
 }
@@ -68,9 +84,11 @@ impl EventHandler for Handler {
                 // Ensure there is a message to edit (send once if missing)
                 let mut lock = state.message_id.write().await;
                 if lock.is_none() {
-                    let mut embed = CreateEmbed::new()
+                    let embed = CreateEmbed::new()
                         .title("Starting…")
-                        .description("Fetching server status…");
+                        .description("Fetching server status…")
+                        .colour(0x5865F2) // Discord blurple-ish
+                        .footer(|f| f.text("dayz-monitor"));
 
                     let msg = CreateMessage::new().add_embed(embed);
 
@@ -109,38 +127,52 @@ impl EventHandler for Handler {
     }
 }
 
-fn now_relative_timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("<t:{secs}:R>")
+fn discord_ts(secs: u64, style: &str) -> String {
+    // style examples: "R" (relative), "f" (full), "t" (time)
+    format!("<t:{secs}:{style}>")
 }
 
 fn build_online_edit(state: &BotState, info: &ServerInfo) -> EditMessage {
-    let title = state.title_online();
-    let players_line = state.line_players(info);
-    let time_line = state.line_time(info);
-    let updated = now_relative_timestamp();
+    let pct = state.occupancy_percent(info);
+    let bar = state.occupancy_bar(info, 18);
+    let players = state.players_summary(info);
+    let time = state.time_summary(info);
+
+    let last_rel = discord_ts(info.last_updated_unix, "R");
+    let last_full = discord_ts(info.last_updated_unix, "f");
 
     let embed = CreateEmbed::new()
-        .title(title)
-        .description(players_line)
-        .field("Details", time_line, false)
-        .field("Last updated", updated, false);
+        .title(state.title_online())
+        .description(format!(
+            "👥 Players: {players}\n📊 Load: {bar} **{pct}%**\n{time}"
+        ))
+        .colour(0x57F287) // green
+        .field("📍 Address", format!("`{}`", state.config.server_address), true)
+        .field("🔄 Update interval", format!("`{}s`", state.config.update_interval_secs), true)
+        .field("🕐 Last updated", format!("{last_rel}\n{last_full}"), false)
+        .footer(|f| f.text("dayz-monitor"));
 
     EditMessage::new().embed(embed)
 }
 
 fn build_offline_edit(state: &BotState, err: &str) -> EditMessage {
-    let title = state.title_offline();
-    let updated = now_relative_timestamp();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let last_rel = discord_ts(now_secs, "R");
+    let last_full = discord_ts(now_secs, "f");
 
     let embed = CreateEmbed::new()
-        .title(title)
-        .description("Could not query the server right now.")
-        .field("Last updated", updated, false)
-        .field("Error", err, false);
+        .title(state.title_offline())
+        .description("⚠️ Could not query the server right now.")
+        .colour(0xED4245) // red
+        .field("📍 Address", format!("`{}`", state.config.server_address), true)
+        .field("🔄 Update interval", format!("`{}s`", state.config.update_interval_secs), true)
+        .field("🕐 Last updated", format!("{last_rel}\n{last_full}"), false)
+        .field("🧾 Error", format!("`{}`", err), false)
+        .footer(|f| f.text("dayz-monitor"));
 
     EditMessage::new().embed(embed)
 }
