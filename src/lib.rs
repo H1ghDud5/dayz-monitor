@@ -1,6 +1,9 @@
 use a2s::{info::ExtendedServerInfo, A2SClient};
 use serde::Deserialize;
-use std::{net::SocketAddr, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    net::SocketAddr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -89,10 +92,7 @@ fn extract_time_and_queue(info: ExtendedServerInfo) -> Option<ServerInfo> {
     for value in split {
         // Queue is usually in keywords as lqs<number>
         if value.starts_with("lqs") {
-            server_info.players_in_queue = value
-                .replace("lqs", "")
-                .parse::<u32>()
-                .ok();
+            server_info.players_in_queue = value.replace("lqs", "").parse::<u32>().ok();
             continue;
         }
 
