@@ -1,22 +1,16 @@
 [package]
 name = "dayz-monitor"
-version = "0.2.0"
-authors = ["Jordyn <jordyn@husk.pro>"]
-edition = "2024"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
 a2s = { version = "0.5.2", features = ["async"] }
 dotenv = "0.15.0"
 eyre = "0.6.12"
-poise = "0.6.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde-env = "0.2.0"
-serenity = { version = "0.12.4", features = ["http"] }
+serenity = { version = "0.12.4", default-features = false, features = ["client", "gateway", "http", "model", "rustls_backend"] }
 thiserror = "2.0.12"
 tokio = { version = "1.44.1", features = ["full"] }
-tracing = { version = "0.1.41" }
+tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-
-[profile.release]
-strip = true
-lto = true
