@@ -153,4 +153,53 @@ fn build_online_edit(state: &BotState, info: &ServerInfo) -> EditMessage {
 }
 
 fn build_offline_edit(state: &BotState, err: &str) -> EditMessage {
-    let now_secs = std::time::SystemTi_
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let last_rel = discord_ts(now_secs, "R");
+    let last_full = discord_ts(now_secs, "f");
+
+    let embed = CreateEmbed::new()
+        .title(state.title_offline())
+        .description("⚠️ Could not query the server right now.")
+        .colour(0xED4245)
+        .field("📍 Address", format!("`{}`", state.config.server_address), true)
+        .field("🔄 Update interval", format!("`{}s`", state.config.update_interval_secs), true)
+        .field("🕐 Last updated", format!("{last_rel}\n{last_full}"), false)
+        .field("🧾 Error", format!("`{}`", err), false)
+        .footer(CreateEmbedFooter::new("dayz-monitor"));
+
+    EditMessage::new().embed(embed)
+}
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
+    let _ = dotenv::dotenv();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    tracing::info!("Loading dayz-monitor configuration from environment variables");
+    let config: DayzMonitorConfig = serde_env::from_env()?;
+
+    let a2s = Arc::new(A2SClient::new().await?);
+
+    // Status-only bot: no privileged intents needed
+    let intents = GatewayIntents::GUILDS;
+
+    let state = Arc::new(BotState {
+        config: config.clone(),
+        a2s,
+        message_id: Arc::new(RwLock::new(None)),
+    });
+
+    let mut client = Client::builder(config.discord_token, intents)
+        .event_handler(Handler { state })
+        .await?;
+
+    client.start().await?;
+    Ok(())
+}
