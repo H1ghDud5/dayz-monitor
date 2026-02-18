@@ -1,59 +1,143 @@
 use std::{sync::Arc, time::Duration};
 
-use dayz_monitor::{DayzMonitorConfig, ServerInfo, retrieve_server_info};
-use serenity::all::GatewayIntents;
+use a2s::A2SClient;
+use dayz_monitor::{retrieve_server_info, DayzMonitorConfig, ServerInfo};
+use serenity::{
+    all::{ChannelId, EditMessage, GatewayIntents, MessageId},
+    async_trait,
+    model::gateway::Ready,
+    prelude::*,
+};
 use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
-type Context<'a> = poise::Context<'a, Data, Error>;
-
-struct Data {
-    server_info: Arc<RwLock<ServerInfo>>,
+struct BotState {
+    config: DayzMonitorConfig,
+    a2s: Arc<A2SClient>,
+    message_id: Arc<RwLock<Option<MessageId>>>,
 }
 
-fn pretty_print_players_in_queue(server_info: &ServerInfo) -> String {
-    match &server_info.players_in_queue {
-        Some(num_queued) => {
-            format!(
-                "{} (+ {}) / {} players online.",
-                server_info.players, num_queued, server_info.max_players
-            )
+impl BotState {
+    fn title_online(&self) -> String {
+        format!("🟢 {} — Online", self.config.server_name)
+    }
+
+    fn title_offline(&self) -> String {
+        format!("🔴 {} — Offline", self.config.server_name)
+    }
+
+    fn line_players(&self, info: &ServerInfo) -> String {
+        match info.players_in_queue {
+            Some(q) if q > 0 => format!("Players: **{} / {}**  •  Queue: **{}**", info.players, info.max_players, q),
+            _ => format!("Players: **{} / {}**", info.players, info.max_players),
         }
-        None => {
-            format!(
-                "{} / {} players online.",
-                server_info.players, server_info.max_players
-            )
+    }
+
+    fn line_time(&self, info: &ServerInfo) -> String {
+        match &info.server_time {
+            Some(t) => format!("Server time: **{}**", t),
+            None => "Server time: *(unavailable)*".to_string(),
         }
     }
 }
 
-#[poise::command(slash_command, prefix_command, aliases("t"))]
-async fn time(ctx: Context<'_>) -> Result<(), Error> {
-    let server_info = ctx.data().server_info.read().await;
-
-    match &server_info.server_time {
-        Some(time) => {
-            ctx.say(format!("Time on the DayZ server is: {}", time))
-                .await?;
-        }
-        None => {
-            ctx.say("Unable to get the current time of the DayZ server.")
-                .await?;
-        }
-    }
-
-    Ok(())
+struct Handler {
+    state: Arc<BotState>,
 }
 
-#[poise::command(slash_command, prefix_command, aliases("c"))]
-async fn count(ctx: Context<'_>) -> Result<(), Error> {
-    let server_info = ctx.data().server_info.read().await;
+#[async_trait]
+impl EventHandler for Handler {
+    async fn ready(&self, ctx: Context, _ready: Ready) {
+        let state = self.state.clone();
+        let http = ctx.http.clone();
 
-    ctx.say(pretty_print_players_in_queue(&server_info)).await?;
+        // If you set STATUS_MESSAGE_ID, we always edit that one.
+        if let Some(mid) = state.config.status_message_id {
+            *state.message_id.write().await = Some(MessageId::new(mid));
+        }
 
-    Ok(())
+        tokio::spawn(async move {
+            let channel_id = ChannelId::new(state.config.text_channel_id);
+
+            loop {
+                // Ensure there is a message to edit (send once if missing)
+                let mut lock = state.message_id.write().await;
+                if lock.is_none() {
+                    match channel_id
+                        .send_message(&http, |m| {
+                            m.embed(|e| {
+                                e.title("Starting…");
+                                e.description("Fetching server status…");
+                                e
+                            })
+                        })
+                        .await
+                    {
+                        Ok(msg) => {
+                            tracing::info!("Posted status message: {}", msg.id);
+                            *lock = Some(msg.id);
+                        }
+                        Err(err) => {
+                            tracing::error!("Failed to send initial status message: {err:#?}");
+                            drop(lock);
+                            tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs)).await;
+                            continue;
+                        }
+                    }
+                }
+
+                let msg_id = lock.unwrap();
+                drop(lock);
+
+                let result = retrieve_server_info(&state.a2s, state.config.server_address).await;
+
+                let edit = match result {
+                    Ok(info) => build_online_embed(&state, &info),
+                    Err(err) => build_offline_embed(&state, &err.to_string()),
+                };
+
+                if let Err(err) = channel_id.edit_message(&http, msg_id, edit).await {
+                    tracing::error!("Failed to edit status message: {err:#?}");
+                }
+
+                tokio::time::sleep(Duration::from_secs(state.config.update_interval_secs)).await;
+            }
+        });
+    }
+}
+
+fn build_online_embed(state: &BotState, info: &ServerInfo) -> EditMessage {
+    let title = state.title_online();
+    let players_line = state.line_players(info);
+    let time_line = state.line_time(info);
+    let updated = format!("<t:{}:R>", (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()));
+
+    EditMessage::new().embed(|e| {
+        e.title(title);
+        e.description(players_line);
+        e.field("Details", time_line, false);
+        e.field("Last updated", updated, false);
+        e
+    })
+}
+
+fn build_offline_embed(state: &BotState, err: &str) -> EditMessage {
+    let title = state.title_offline();
+    let updated = format!("<t:{}:R>", (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()));
+
+    EditMessage::new().embed(|e| {
+        e.title(title);
+        e.description("Could not query the server right now.");
+        e.field("Last updated", updated, false);
+        e.field("Error", err, false);
+        e
+    })
 }
 
 #[tokio::main]
@@ -66,87 +150,22 @@ async fn main() -> eyre::Result<()> {
 
     tracing::info!("Loading dayz-monitor configuration from environment variables");
     let config: DayzMonitorConfig = serde_env::from_env()?;
-    tracing::debug!("Loaded config: {config:#?}");
 
-    let client = a2s::A2SClient::new().await?;
+    let a2s = Arc::new(A2SClient::new().await?);
 
-    tracing::info!("Polling server for current information.");
-    let server_info = Arc::new(RwLock::new(
-        retrieve_server_info(&client, config.server_address).await?,
-    ));
+    // Status-only: no privileged intents needed.
+    let intents = GatewayIntents::GUILDS;
 
-    let info_clone = server_info.clone();
-    let http_client = serenity::http::Http::new(&config.discord_token);
-    let voice_channel_id = config.voice_channel_id;
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-
-        loop {
-            tracing::trace!("Updating internal server info state");
-
-            match retrieve_server_info(&client, config.server_address).await {
-                Ok(server_info) => {
-                    if let Some(voice_channel_id) = voice_channel_id {
-                        let updated_name = format!(
-                            "{}: {}",
-                            config.server_name,
-                            pretty_print_players_in_queue(&server_info)
-                        );
-                        tracing::trace!("Updating voice channel with name '{updated_name}'");
-
-                        let builder = serenity::all::EditChannel::new().name(updated_name);
-                        if let Err(why) = http_client
-                            .edit_channel(voice_channel_id.into(), &builder, None)
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to update voice channel with id {voice_channel_id} because: {why:#?}"
-                            )
-                        }
-                    }
-
-                    *info_clone.write().await = server_info;
-                }
-                Err(why) => tracing::error!("Failed to update server info: {why}"),
-            }
-
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
+    let state = Arc::new(BotState {
+        config: config.clone(),
+        a2s,
+        message_id: Arc::new(RwLock::new(None)),
     });
 
-    let intents = GatewayIntents::non_privileged()
-        | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::GUILDS;
-
-    let framework = poise::Framework::builder()
-        .options(poise::FrameworkOptions {
-            commands: vec![time(), count()],
-            prefix_options: poise::PrefixFrameworkOptions {
-                prefix: Some("!".into()),
-                edit_tracker: Some(Arc::new(poise::EditTracker::for_timespan(
-                    Duration::from_secs(3600),
-                ))),
-                additional_prefixes: vec![poise::Prefix::Literal("~"), poise::Prefix::Literal(".")],
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .setup(|ctx, _ready, framework| {
-            Box::pin(async move {
-                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                Ok(Data { server_info })
-            })
-        })
-        .build();
-
-    let mut client = serenity::client::ClientBuilder::new(config.discord_token, intents)
-        .framework(framework)
+    let mut client = Client::builder(config.discord_token, intents)
+        .event_handler(Handler { state })
         .await?;
 
     client.start().await?;
-
-    tracing::info!("dayz-monitor shutting down.");
-
     Ok(())
 }
